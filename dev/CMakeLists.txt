@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.5)
 project(PlutoSDR CXX)
 
 set(CMAKE_BUILD_TYPE Debug)
@@ -10,11 +10,5 @@ option(PLUTO_TIMESTAMP "Build pluto with timestamp" ON)
 # RF frontend driver
 find_package(SoapySDR REQUIRED)
 
-set(MAIN_SOURCE_FILES
-    main.cpp
-)
-
-# Добавляем исполняемый файл
-add_executable(main ${MAIN_SOURCE_FILES})
-
+add_executable(main main.cpp)
 target_link_libraries(main ${SoapySDR_LIBRARIES})
