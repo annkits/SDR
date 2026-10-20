@@ -5,8 +5,8 @@
 #include <stdint.h>
 #include <string.h>
 
-static const double FREQ_TX = 433e6;
-static const double FREQ_RX = 433e6;
+static const double FREQ_DOWN = 433e6;
+static const double FREQ_UP   = 434e6;
 
 static const double SAMPLE_RATE = 1e6;
 static const double GAIN_TX = -40.0;
@@ -15,10 +15,18 @@ static const double GAIN_RX = 35.0;
 static const long TIMEOUT_US = 5000000;
 static const size_t ITERATION_COUNT = 200;
 
-static void run_tx(SoapySDRDevice* sdr)
+static double select_frequency(const char* channel)
+{
+    if (strcmp(channel, "up") == 0) {
+        return FREQ_UP;
+    }
+    return FREQ_DOWN;
+}
+
+static void run_tx(SoapySDRDevice* sdr, double freq)
 {
     SoapySDRDevice_setSampleRate(sdr, SOAPY_SDR_TX, 0, SAMPLE_RATE);
-    SoapySDRDevice_setFrequency (sdr, SOAPY_SDR_TX, 0, FREQ_TX, NULL);
+    SoapySDRDevice_setFrequency (sdr, SOAPY_SDR_TX, 0, freq, NULL);
     SoapySDRDevice_setGain(sdr, SOAPY_SDR_TX, 0, GAIN_TX);
 
     printf("TX freq: %.0f Hz, sample rate: %.0f Hz\n",
@@ -45,10 +53,10 @@ static void run_tx(SoapySDRDevice* sdr)
 
     for (size_t i = 0; i < 2 * tx_mtu; i += 2) {
         if ((i / 2) % 2 == 0) {
-            tx_buff[i] = 1500 << 4;
+            tx_buff[i]     = 1500 << 4;
             tx_buff[i + 1] = 1500 << 4;
         } else {
-            tx_buff[i] = 0;
+            tx_buff[i]     = 0;
             tx_buff[i + 1] = 0;
         }
     }
@@ -62,7 +70,8 @@ static void run_tx(SoapySDRDevice* sdr)
     printf("Start TX...\n");
 
     long long tx_time = 0;
-    long long buffer_duration_ns = (long long)tx_mtu * 1000000000LL / (long long)SAMPLE_RATE;
+    long long buffer_duration_ns =
+        (long long)tx_mtu * 1000000000LL / (long long)SAMPLE_RATE;
 
     for (size_t n = 0; n < ITERATION_COUNT; n++)
     {
@@ -70,7 +79,9 @@ static void run_tx(SoapySDRDevice* sdr)
         int flags = SOAPY_SDR_HAS_TIME;
         tx_time += buffer_duration_ns;
 
-        int st = SoapySDRDevice_writeStream(sdr, txStream, (const void* const*)tx_buffs, tx_mtu, &flags, tx_time, TIMEOUT_US);
+        int st = SoapySDRDevice_writeStream(sdr, txStream,
+                                            (const void* const*)tx_buffs,
+                                            tx_mtu, &flags, tx_time, TIMEOUT_US);
         if ((size_t)st != tx_mtu) {
             printf("writeStream error %d: %s\n", st, SoapySDRDevice_lastError());
         } else {
@@ -85,10 +96,10 @@ static void run_tx(SoapySDRDevice* sdr)
     printf("TX complete!\n");
 }
 
-static void run_rx(SoapySDRDevice* sdr)
+static void run_rx(SoapySDRDevice* sdr, double freq)
 {
     SoapySDRDevice_setSampleRate(sdr, SOAPY_SDR_RX, 0, SAMPLE_RATE);
-    SoapySDRDevice_setFrequency (sdr, SOAPY_SDR_RX, 0, FREQ_RX, NULL);
+    SoapySDRDevice_setFrequency (sdr, SOAPY_SDR_RX, 0, freq, NULL);
     SoapySDRDevice_setGain(sdr, SOAPY_SDR_RX, 0, GAIN_RX);
 
     printf("RX freq: %.0f Hz, sample rate: %.0f Hz\n",
@@ -96,7 +107,8 @@ static void run_rx(SoapySDRDevice* sdr)
            SoapySDRDevice_getSampleRate(sdr, SOAPY_SDR_RX, 0));
 
     size_t channels[] = {0};
-    SoapySDRStream* rxStream = SoapySDRDevice_setupStream(sdr, SOAPY_SDR_RX, SOAPY_SDR_CS16, channels, 1, NULL);
+    SoapySDRStream* rxStream = SoapySDRDevice_setupStream(
+        sdr, SOAPY_SDR_RX, SOAPY_SDR_CS16, channels, 1, NULL);
     if (!rxStream) {
         printf("setupStream RX fail: %s\n", SoapySDRDevice_lastError());
         return;
@@ -136,13 +148,15 @@ static void run_rx(SoapySDRDevice* sdr)
         int flags = 0;
         long long timeNs = 0;
 
-        int sr = SoapySDRDevice_readStream(sdr, rxStream, rx_buffs, rx_mtu, &flags, &timeNs, TIMEOUT_US);
+        int sr = SoapySDRDevice_readStream(sdr, rxStream, rx_buffs, rx_mtu,
+                                           &flags, &timeNs, TIMEOUT_US);
         if (sr < 0) {
             printf("readStream error %d: %s\n", sr, SoapySDRDevice_lastError());
             continue;
         }
 
-        printf("Buffer %zu: Samples=%d, Flags=%d, Time=%lld, Diff=%lld\n", n, sr, flags, timeNs, timeNs - last_time);
+        printf("Buffer %zu: Samples=%d, Flags=%d, Time=%lld, Diff=%lld\n",
+               n, sr, flags, timeNs, timeNs - last_time);
         last_time = timeNs;
 
         fwrite(rx_buffer, sizeof(int16_t), 2 * sr, file);
@@ -160,21 +174,29 @@ static void run_rx(SoapySDRDevice* sdr)
 
 int main(int argc, char* argv[])
 {
-    if (argc < 3) {
-        printf("Usage: %s <uri> <mode>\n", argv[0]);
-        printf("  <uri>  — URI устройства, например: usb:1.3.5 или ip:192.168.2.1\n");
-        printf("  <mode> — режим работы: tx или rx\n");
+    if (argc < 4) {
+        printf("Usage: %s <uri> <mode> <channel>\n", argv[0]);
+        printf("  <uri>     — URI устройства, например: usb:1.3.5 или ip:192.168.2.1\n");
+        printf("  <mode>    — режим работы: tx или rx\n");
+        printf("  <channel> — канал: down (прямой) или up (обратный)\n");
         printf("Examples:\n");
-        printf("  %s usb:1.3.5 tx\n", argv[0]);
-        printf("  %s usb:1.5.5 rx\n", argv[0]);
+        printf("  %s usb:1.3.5 tx down   # SDR №1 передаёт на 433 МГц\n", argv[0]);
+        printf("  %s usb:1.5.5 rx down   # SDR №2 принимает на 433 МГц\n", argv[0]);
+        printf("  %s usb:1.5.5 tx up     # SDR №2 передаёт на 434 МГц\n", argv[0]);
+        printf("  %s usb:1.3.5 rx up     # SDR №1 принимает на 434 МГц\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    const char* uri  = argv[1];
-    const char* mode = argv[2];
+    const char* uri     = argv[1];
+    const char* mode    = argv[2];
+    const char* channel = argv[3];
 
-    printf("SDR URI: %s\n", uri);
-    printf("Mode:    %s\n", mode);
+    printf("SDR URI:  %s\n", uri);
+    printf("Mode:     %s\n", mode);
+    printf("Channel:  %s\n", channel);
+
+    double freq = select_frequency(channel);
+    printf("Selected frequency: %.0f Hz\n", freq);
 
     SoapySDRKwargs args = {};
     SoapySDRKwargs_set(&args, "driver", "plutosdr");
@@ -195,9 +217,9 @@ int main(int argc, char* argv[])
     }
 
     if (strcmp(mode, "tx") == 0) {
-        run_tx(sdr);
+        run_tx(sdr, freq);
     } else if (strcmp(mode, "rx") == 0) {
-        run_rx(sdr);
+        run_rx(sdr, freq);
     } else {
         printf("Unknown mode: %s (expected 'tx' or 'rx')\n", mode);
         SoapySDRDevice_unmake(sdr);
