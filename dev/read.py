@@ -4,9 +4,14 @@ import sys
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Путь к файлу можно передать аргументом, по умолчанию - dev/build/txdata.pcm
-name = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "build", "txdata.pcm")
+# Аргумент: канал down/up (файл dev/build/rx_<канал>.pcm) или путь к файлу,
+# по умолчанию - down
+arg = sys.argv[1] if len(sys.argv) > 1 else "down"
+if arg in ("down", "up"):
+    name = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "build", f"rx_{arg}.pcm")
+else:
+    name = arg
 
 # Сколько отсчетов показывать: период "вкл/выкл" = 3840 отсчетов,
 # на всем файле прямоугольники сливаются в сплошную полосу

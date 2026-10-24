@@ -10,6 +10,10 @@
 static volatile sig_atomic_t running = 1;
 static void on_sigint(int) { running = 0; }
 
+// Частоты каналов: downlink (прямой) и uplink (обратный)
+static const double FREQ_DOWN = 433e6;
+static const double FREQ_UP   = 434e6;
+
 SoapySDRDevice *make_device(const char *uri) {
   SoapySDRKwargs args = {};
   SoapySDRKwargs_set(&args, "driver","plutosdr");
@@ -26,12 +30,12 @@ SoapySDRDevice *make_device(const char *uri) {
 }
 
 
-int run_rx(const char *uri) {
+int run_rx(const char *uri, double freq, const char *filename) {
   SoapySDRDevice *sdr = make_device(uri);
   if (sdr == NULL) return 1;
 
   int sample_rate = 1e6;
-  int freq = 800e6;  // должна совпадать с частотой TX у передающей SDR
+  printf("RX freq: %.0f Hz\n", freq);  // должна совпадать с частотой TX у передающей SDR
 
   // Параметры RX части
   SoapySDRDevice_setSampleRate(sdr, SOAPY_SDR_RX, 0, sample_rate);
@@ -63,9 +67,9 @@ int run_rx(const char *uri) {
   long long last_time = 0;
 
   // Создаем файл для записи сэмплов с rx_buff (перезаписываем, а не дописываем)
-  FILE *file = fopen("txdata.pcm", "wb");
+  FILE *file = fopen(filename, "wb");
   if (file == NULL) {
-    printf("Cannot open txdata.pcm\n");
+    printf("Cannot open %s\n", filename);
     free(rx_buffer);
     SoapySDRDevice_closeStream(sdr, rxStream);
     SoapySDRDevice_unmake(sdr);
@@ -97,7 +101,7 @@ int run_rx(const char *uri) {
   }
   fclose(file);
   free(rx_buffer);
-  printf("Saved %zu buffers to txdata.pcm\n", buffers_read);
+  printf("Saved %zu buffers to %s\n", buffers_read, filename);
 
   // stop streaming
   SoapySDRDevice_deactivateStream(sdr, rxStream, 0, 0);
@@ -110,13 +114,14 @@ int run_rx(const char *uri) {
   return 0;
 }
 
-int run_tx(const char *uri) {
+int run_tx(const char *uri, double freq_tx, double freq_rx) {
   SoapySDRDevice *sdr = make_device(uri);
   if (sdr == NULL) return 1;
 
   int sample_rate = 1e6;
-  int freq_tx = 800e6;  // должна совпадать с частотой RX у принимающей SDR
-  int freq_rx = 850e6;  // RX здесь нужен только для временных меток
+  // freq_tx должна совпадать с частотой RX у принимающей SDR,
+  // RX здесь нужен только для временных меток
+  printf("TX freq: %.0f Hz\n", freq_tx);
   // Параметры TX части
   SoapySDRDevice_setSampleRate(sdr, SOAPY_SDR_RX, 0, sample_rate);
   SoapySDRDevice_setSampleRate(sdr, SOAPY_SDR_TX, 0, sample_rate);
@@ -212,16 +217,35 @@ int run_tx(const char *uri) {
 }
 
 int main(int argc, char *argv[]) {
-  if (argc < 3) {
+  if (argc < 4) {
     // URI обязателен: у двух SDR он разный (см. SoapySDRUtil --find)
-    printf("Использовать так: %s <rx|tx> <uri>\n", argv[0]);
-    printf("Пример: %s tx usb:1.5.5\n", argv[0]);
+    printf("Использовать так: %s <rx|tx> <uri> <down|up>\n", argv[0]);
+    printf("  down - прямой канал (downlink), %.0f МГц\n", FREQ_DOWN / 1e6);
+    printf("  up   - обратный канал (uplink), %.0f МГц\n", FREQ_UP / 1e6);
+    printf("Примеры:\n");
+    printf("  %s tx usb:1.3.5 down   # SDR №1 передает на %.0f МГц\n", argv[0], FREQ_DOWN / 1e6);
+    printf("  %s rx usb:1.5.5 down   # SDR №2 принимает на %.0f МГц\n", argv[0], FREQ_DOWN / 1e6);
+    printf("  %s tx usb:1.5.5 up     # SDR №2 передает на %.0f МГц\n", argv[0], FREQ_UP / 1e6);
+    printf("  %s rx usb:1.3.5 up     # SDR №1 принимает на %.0f МГц\n", argv[0], FREQ_UP / 1e6);
     return 1;
   }
   const char *uri = argv[2];
+  const char *channel = argv[3];
+
+  double freq, freq_other;
+  const char *filename;
+  if (strcmp(channel, "down") == 0) {
+    freq = FREQ_DOWN; freq_other = FREQ_UP; filename = "rx_down.pcm";
+  } else if (strcmp(channel, "up") == 0) {
+    freq = FREQ_UP; freq_other = FREQ_DOWN; filename = "rx_up.pcm";
+  } else {
+    printf("Ошибка канала: %s (ожидается down или up)\n", channel);
+    return 1;
+  }
+
   signal(SIGINT, on_sigint);
-  if (strcmp(argv[1], "rx") == 0){return run_rx(uri);}
-  else if (strcmp(argv[1], "tx") == 0) {return run_tx(uri);}
+  if (strcmp(argv[1], "rx") == 0){return run_rx(uri, freq, filename);}
+  else if (strcmp(argv[1], "tx") == 0) {return run_tx(uri, freq, freq_other);}
   else {
     printf("Ошибка режима работы\n");
     return 1;
