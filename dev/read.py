@@ -1,31 +1,39 @@
+import os
+import sys
+
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Открываем файл для чтения
-name = "/mnt/c/Users/annpo/Desktop/учёба/sdr/dev/build/txdata.pcm"
+# Путь к файлу можно передать аргументом, по умолчанию - dev/build/txdata.pcm
+name = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "build", "txdata.pcm")
 
-data = []
-imag = []
-real = []
-count = []
-counter = 0
-with open(name, "rb") as f:
-    index = 0
-    while (byte := f.read(2)):
-        if (index % 2 == 0):
-            real.append(int.from_bytes(byte, byteorder='little', signed=True))
-            counter += 1
-            count.append(counter)
-        else:
-            imag.append(int.from_bytes(byte, byteorder='little', signed=True))
-        index += 1
+# Сколько отсчетов показывать: период "вкл/выкл" = 3840 отсчетов,
+# на всем файле прямоугольники сливаются в сплошную полосу
+N = 20000
 
-# Инициализируем список для хранения данных
+# Файл: чередующиеся int16 little-endian I, Q, I, Q, ...
+data = np.fromfile(name, dtype='<i2').astype(np.float32)
+real = data[0::2]
+imag = data[1::2]
 
+complex_signal = real + 1j * imag
+amplitude = np.abs(complex_signal)
+print(f"Всего отсчетов: {len(amplitude)}, max = {amplitude.max():.0f}, "
+      f"среднее = {amplitude.mean():.1f}")
 
-# fig, axs = plt.subplots(2, 1, layout='constrained')
-plt.figure(1)
-# axs\[1\].plot(count, np.abs(data),  color='grey')  # Используем scatter для диаграммы созвездия
-plt.plot(count, (imag), color='red')  # Используем scatter для диаграммы созвездия
-plt.plot(count, (real), color='blue')  # Используем scatter для диаграммы созвездия
+# Начинаем с самого сильного отсчета, чтобы не смотреть на шум до старта TX
+start = max(0, int(np.argmax(amplitude)) - N // 2)
+segment = amplitude[start:start + N]
+count = np.arange(start, start + len(segment))
+
+plt.figure(figsize=(12, 8))
+
+plt.plot(count, segment, color='red', label='|I + jQ|')
+plt.title("Амплитуда")
+plt.xlabel("Отсчеты")
+plt.ylabel("Амплитуда")
+plt.legend()
+plt.grid(True)
+
 plt.show()
