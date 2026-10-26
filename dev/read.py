@@ -15,7 +15,7 @@ else:
 
 # Сколько отсчетов показывать: период "вкл/выкл" = 3840 отсчетов,
 # на всем файле прямоугольники сливаются в сплошную полосу
-N = 20000
+N = 2000000
 
 # Файл: чередующиеся int16 little-endian I, Q, I, Q, ...
 data = np.fromfile(name, dtype='<i2').astype(np.float32)
@@ -34,10 +34,12 @@ count = np.arange(start, start + len(segment))
 
 plt.figure(figsize=(12, 8))
 
-plt.plot(count, segment, color='red', label='|I + jQ|')
-plt.title("Амплитуда")
+plt.plot(count, real[start:start + N], linewidth=0.7, label='I')
+plt.plot(count, imag[start:start + N], linewidth=0.7, label='Q')
+plt.plot(count, segment, color='black', linewidth=0.7, label='|I + jQ|')
+plt.title("I, Q и амплитуда")
 plt.xlabel("Отсчеты")
-plt.ylabel("Амплитуда")
+plt.ylabel("Значение")
 plt.legend()
 plt.grid(True)
 

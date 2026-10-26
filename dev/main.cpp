@@ -43,7 +43,7 @@ int run_rx(const char *uri, double freq, const char *filename) {
 
   // Инициализация количества каналов RX (в AdalmPluto он один, нулевой)
   size_t channels[] = {0};
-  SoapySDRDevice_setGain(sdr, SOAPY_SDR_RX, *channels, 40.0);  // Чувствительность приемника, 0..73
+  SoapySDRDevice_setGain(sdr, SOAPY_SDR_RX, *channels, 20.0);  // Чувствительность приемника
 
   size_t channel_count = sizeof(channels) / sizeof(channels[0]);
   // Формирование потока для приема сэмплов
