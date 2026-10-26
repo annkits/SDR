@@ -22,8 +22,11 @@ amplitude = np.abs(complex_signal)
 print(f"Всего отсчетов: {len(amplitude)}, max = {amplitude.max():.0f}, "
       f"среднее = {amplitude.mean():.1f}")
 
-first = int(np.argmax(amplitude > amplitude.max() / 2))
+threshold = (np.percentile(amplitude, 5) + np.percentile(amplitude, 99)) / 2
+first = int(np.argmax(amplitude > threshold))
 start = max(0, first - N // 20)
+print(f"Порог = {threshold:.0f}, начало сигнала: отсчет {first}, "
+      f"окно {start}..{min(start + N, len(amplitude))}")
 count = np.arange(len(amplitude))
 
 plt.figure(figsize=(12, 8))
