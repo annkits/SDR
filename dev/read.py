@@ -4,8 +4,6 @@ import sys
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Аргумент: канал down/up (файл dev/build/rx_<канал>.pcm) или путь к файлу,
-# по умолчанию - down
 arg = sys.argv[1] if len(sys.argv) > 1 else "down"
 if arg in ("down", "up"):
     name = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -13,11 +11,8 @@ if arg in ("down", "up"):
 else:
     name = arg
 
-# Сколько отсчетов показывать: период "вкл/выкл" = 3840 отсчетов,
-# на всем файле прямоугольники сливаются в сплошную полосу
-N = 20000
+N = int(sys.argv[2]) if len(sys.argv) > 2 else 100000
 
-# Файл: чередующиеся int16 little-endian I, Q, I, Q, ...
 data = np.fromfile(name, dtype='<i2').astype(np.float32)
 real = data[0::2]
 imag = data[1::2]
@@ -27,14 +22,14 @@ amplitude = np.abs(complex_signal)
 print(f"Всего отсчетов: {len(amplitude)}, max = {amplitude.max():.0f}, "
       f"среднее = {amplitude.mean():.1f}")
 
-# Начинаем с самого сильного отсчета, чтобы не смотреть на шум до старта TX
-start = max(0, int(np.argmax(amplitude)) - N // 2)
-segment = amplitude[start:start + N]
-count = np.arange(start, start + len(segment))
+first = int(np.argmax(amplitude > amplitude.max() / 2))
+start = max(0, first - N // 20)
+count = np.arange(len(amplitude))
 
 plt.figure(figsize=(12, 8))
 
-plt.plot(count, segment, color='red', label='|I + jQ|')
+plt.plot(count, amplitude, color='red', linewidth=0.8, label='|I + jQ|')
+plt.xlim(start, min(start + N, len(amplitude)))
 plt.title("Амплитуда")
 plt.xlabel("Отсчеты")
 plt.ylabel("Амплитуда")
