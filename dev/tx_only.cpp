@@ -1,5 +1,5 @@
-#include <SoapySDR/Device.h>
-#include <SoapySDR/Formats.h>
+#include <SoapySDR/Device.h>   // инициализация устройства
+#include <SoapySDR/Formats.h>  // форматы сэмплов
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -19,6 +19,7 @@ int main(int argc, char* argv[])
 
     printf("TX SDR URI: %s\n", uri_tx);
 
+    // Параметры устройства
     SoapySDRKwargs args = {};
     SoapySDRKwargs_set(&args, "driver", "plutosdr");
     SoapySDRKwargs_set(&args, "uri", uri_tx);
@@ -37,6 +38,7 @@ int main(int argc, char* argv[])
     const double freq_tx = 433e6;
     const double sample_rate = 1e6;
 
+    // Параметры TX
     SoapySDRDevice_setSampleRate(sdr, SOAPY_SDR_TX, 0, sample_rate);
     SoapySDRDevice_setFrequency (sdr, SOAPY_SDR_TX, 0, freq_tx, NULL);
     SoapySDRDevice_setGain(sdr, SOAPY_SDR_TX, 0, -40.0);
@@ -45,6 +47,7 @@ int main(int argc, char* argv[])
            SoapySDRDevice_getFrequency(sdr, SOAPY_SDR_TX, 0),
            SoapySDRDevice_getSampleRate(sdr, SOAPY_SDR_TX, 0));
 
+    // Канал (в Pluto один, нулевой)
     size_t channels[] = {0};
     SoapySDRStream* txStream = SoapySDRDevice_setupStream(
         sdr, SOAPY_SDR_TX, SOAPY_SDR_CS16, channels, 1, NULL);
@@ -65,6 +68,7 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
+    // Буфер: четные отсчеты - сигнал, нечетные - нули
     for (size_t i = 0; i < 2 * tx_mtu; i += 2) {
         if ((i / 2) % 2 == 0) {
             tx_buff[i]     = 1500 << 4;
@@ -83,9 +87,11 @@ int main(int argc, char* argv[])
 
     printf("Start TX...\n");
 
+    // Время отправки растет на длительность буфера
     long long tx_time = 0;
     long long buffer_duration_ns = (long long)tx_mtu * 1000000000LL / (long long)sample_rate;
 
+    // Цикл передачи
     for (size_t n = 0; n < iteration_count; n++)
     {
         void* tx_buffs[] = {tx_buff};
@@ -102,6 +108,7 @@ int main(int argc, char* argv[])
         }
     }
 
+    // Остановка и освобождение устройства
     SoapySDRDevice_deactivateStream(sdr, txStream, 0, 0);
     SoapySDRDevice_closeStream(sdr, txStream);
     SoapySDRDevice_unmake(sdr);

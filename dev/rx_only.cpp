@@ -1,5 +1,5 @@
-#include <SoapySDR/Device.h>
-#include <SoapySDR/Formats.h>
+#include <SoapySDR/Device.h>   // инициализация устройства
+#include <SoapySDR/Formats.h>  // форматы сэмплов
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -19,6 +19,7 @@ int main(int argc, char* argv[])
 
     printf("RX SDR URI: %s\n", uri_rx);
 
+    // Параметры устройства
     SoapySDRKwargs args = {};
     SoapySDRKwargs_set(&args, "driver", "plutosdr");
     SoapySDRKwargs_set(&args, "uri", uri_rx);
@@ -37,6 +38,7 @@ int main(int argc, char* argv[])
     const double freq_rx = 433e6;
     const double sample_rate = 1e6;
 
+    // Параметры RX
     SoapySDRDevice_setSampleRate(sdr, SOAPY_SDR_RX, 0, sample_rate);
     SoapySDRDevice_setFrequency (sdr, SOAPY_SDR_RX, 0, freq_rx, NULL);
     SoapySDRDevice_setGain(sdr, SOAPY_SDR_RX, 0, 35.0);
@@ -45,6 +47,7 @@ int main(int argc, char* argv[])
            SoapySDRDevice_getFrequency(sdr, SOAPY_SDR_RX, 0),
            SoapySDRDevice_getSampleRate(sdr, SOAPY_SDR_RX, 0));
 
+    // Канал (в Pluto один, нулевой)
     size_t channels[] = {0};
     SoapySDRStream* rxStream = SoapySDRDevice_setupStream(
         sdr, SOAPY_SDR_RX, SOAPY_SDR_CS16, channels, 1, NULL);
@@ -71,6 +74,7 @@ int main(int argc, char* argv[])
         printf("activateStream RX failed: %s\n", SoapySDRDevice_lastError());
     }
 
+    // Файл для сэмплов
     FILE* file = fopen("rxdata.pcm", "wb");
     if (!file) {
         printf("Cannot open rxdata.pcm\n");
@@ -82,6 +86,7 @@ int main(int argc, char* argv[])
 
     printf("Start RX...\n");
 
+    // Цикл приема
     for (size_t n = 0; n < iteration_count; n++)
     {
         void* rx_buffs[] = {rx_buffer};
@@ -104,6 +109,7 @@ int main(int argc, char* argv[])
 
     fclose(file);
 
+    // Остановка и освобождение устройства
     SoapySDRDevice_deactivateStream(sdr, rxStream, 0, 0);
     SoapySDRDevice_closeStream(sdr, rxStream);
     SoapySDRDevice_unmake(sdr);
