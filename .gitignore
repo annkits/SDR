@@ -2,3 +2,6 @@
 .vscode
 venv/
 build/
+__pycache__/
+# настройки окна imgui (read.py)
+*.ini

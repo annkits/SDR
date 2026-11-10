@@ -14,9 +14,10 @@ static void on_sigint(int) { running = 0; }
 static const double FREQ_DOWN = 433e6;
 static const double FREQ_UP   = 434e6;
 
-// Параметры BPSK
+// Параметры модуляции
 static const size_t SPS = 10;     // отсчетов на символ (1 МГц / 10 = 100 кбод)
 static const int16_t AMP = 1500;  // амплитуда, ЦАП 12 бит (до 2047)
+static const int16_t AMP_QPSK = 1061;  // AMP / sqrt(2) по I и Q: та же мощность, что у BPSK
 
 // Преамбула - код Баркера-13
 static const uint8_t PREAMBLE[] = {1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1};
@@ -32,8 +33,8 @@ static uint8_t prbs9_next(void) {
   return bit;
 }
 
-// Бит в уровень: 1 -> +AMP, 0 -> -AMP
-static int16_t bit_level(uint8_t bit) { return bit ? AMP : -AMP; }
+// Бит в уровень: 1 -> +amp, 0 -> -amp
+static int16_t bit_level(uint8_t bit, int16_t amp) { return bit ? amp : -amp; }
 
 // Свертка y[n] = sum h[m] * x[n - m], хвост после n отсчетов отбрасывается
 static void convolve(const int16_t *x, size_t n, const int16_t *h, size_t h_len, int16_t *y) {
@@ -44,38 +45,52 @@ static void convolve(const int16_t *x, size_t n, const int16_t *h, size_t h_len,
   }
 }
 
-// Пакет: преамбула + биты PRBS-9, сигнал только в I.
+// Пакет: преамбула + биты PRBS-9.
+// Преамбула всегда BPSK в I. Данные:
+//   BPSK - один бит на символ, только I;
+//   QPSK - два бита на символ: первый задает знак I, второй знак Q (код Грея).
 // Генератор сбрасывается в начале пакета, поэтому все пакеты одинаковые.
 // Возвращает количество бит данных.
-static size_t fill_packet(int16_t *buf, size_t n_samples) {
+static size_t fill_packet(int16_t *buf, size_t n_samples, bool qpsk) {
   lfsr = PRBS9_SEED;
   size_t n_symbols = n_samples / SPS;
   size_t n_up = n_symbols * SPS;
 
   // Повышение частоты: символ в первом отсчете, остальные SPS-1 нули
-  int16_t *up = (int16_t *)calloc(n_up, sizeof(int16_t));
+  int16_t *up_i = (int16_t *)calloc(n_up, sizeof(int16_t));
+  int16_t *up_q = (int16_t *)calloc(n_up, sizeof(int16_t));
   for (size_t k = 0; k < n_symbols; k++) {
-    uint8_t bit = (k < PREAMBLE_LEN) ? PREAMBLE[k] : prbs9_next();
-    up[k * SPS] = bit_level(bit);
+    if (k < PREAMBLE_LEN) {
+      up_i[k * SPS] = bit_level(PREAMBLE[k], AMP);
+    } else if (qpsk) {
+      up_i[k * SPS] = bit_level(prbs9_next(), AMP_QPSK);
+      up_q[k * SPS] = bit_level(prbs9_next(), AMP_QPSK);
+    } else {
+      up_i[k * SPS] = bit_level(prbs9_next(), AMP);
+    }
   }
 
-  // Формирующий фильтр: прямоугольный импульс из SPS единиц
+  // Формирующий фильтр: прямоугольный импульс из SPS единиц, отдельно для I и Q
   int16_t h[SPS];
   for (size_t m = 0; m < SPS; m++) h[m] = 1;
-  int16_t *shaped = (int16_t *)malloc(n_up * sizeof(int16_t));
-  convolve(up, n_up, h, SPS, shaped);
+  int16_t *shaped_i = (int16_t *)malloc(n_up * sizeof(int16_t));
+  int16_t *shaped_q = (int16_t *)malloc(n_up * sizeof(int16_t));
+  convolve(up_i, n_up, h, SPS, shaped_i);
+  convolve(up_q, n_up, h, SPS, shaped_q);
 
   // Запись в буфер: I, Q чередуются, сдвиг << 4 под 12-битный ЦАП
   for (size_t n = 0; n < n_up; n++) {
-    buf[2 * n] = shaped[n] << 4;  // I
-    buf[2 * n + 1] = 0;           // Q
+    buf[2 * n] = shaped_i[n] << 4;      // I
+    buf[2 * n + 1] = shaped_q[n] << 4;  // Q
   }
   // Остаток буфера - нули
   for (size_t i = 2 * n_up; i < 2 * n_samples; i++) buf[i] = 0;
 
-  free(up);
-  free(shaped);
-  return n_symbols - PREAMBLE_LEN;
+  free(up_i);
+  free(up_q);
+  free(shaped_i);
+  free(shaped_q);
+  return (n_symbols - PREAMBLE_LEN) * (qpsk ? 2 : 1);
 }
 
 SoapySDRDevice *make_device(const char *uri) {
@@ -175,7 +190,7 @@ int run_rx(const char *uri, double freq, const char *filename) {
   return 0;
 }
 
-int run_tx(const char *uri, double freq_tx, double freq_rx) {
+int run_tx(const char *uri, double freq_tx, double freq_rx, bool qpsk) {
   SoapySDRDevice *sdr = make_device(uri);
   if (sdr == NULL) return 1;
 
@@ -210,13 +225,14 @@ int run_tx(const char *uri, double freq_tx, double freq_rx) {
   size_t rx_mtu = SoapySDRDevice_getStreamMTU(sdr, rxStream);
   printf("TX MTU: %zu, RX MTU: %zu\n", tx_mtu, rx_mtu);
 
-  // Два буфера TX: пакет BPSK и тишина, передаются по очереди.
+  // Два буфера TX: пакет BPSK/QPSK и тишина, передаются по очереди.
   // Метку времени в начало буфера драйвер ставит сам по tx_time.
   int16_t *tx_on = (int16_t *)malloc(2 * tx_mtu * sizeof(int16_t));
   int16_t *tx_off = (int16_t *)calloc(2 * tx_mtu, sizeof(int16_t));
-  size_t data_bits = fill_packet(tx_on, tx_mtu);
-  printf("BPSK: SPS %zu, symbols per packet %zu (preamble %zu + data %zu)\n",
-         SPS, tx_mtu / SPS, PREAMBLE_LEN, data_bits);
+  size_t data_bits = fill_packet(tx_on, tx_mtu, qpsk);
+  printf("%s: SPS %zu, symbols per packet %zu (preamble %zu + data %zu), data bits %zu\n",
+         qpsk ? "QPSK" : "BPSK", SPS, tx_mtu / SPS, PREAMBLE_LEN,
+         tx_mtu / SPS - PREAMBLE_LEN, data_bits);
 
   // Буфер RX
   int16_t *rx_buffer = (int16_t *)malloc(2 * rx_mtu * sizeof(int16_t));
@@ -273,13 +289,14 @@ int run_tx(const char *uri, double freq_tx, double freq_rx) {
 int main(int argc, char *argv[]) {
   if (argc < 4) {
     // URI у двух SDR разный (SoapySDRUtil --find)
-    printf("Использовать так: %s <rx|tx> <uri> <down|up>\n", argv[0]);
+    printf("Использовать так: %s <rx|tx> <uri> <down|up> [bpsk|qpsk]\n", argv[0]);
     printf("  down - прямой канал (downlink), %.0f МГц\n", FREQ_DOWN / 1e6);
     printf("  up   - обратный канал (uplink), %.0f МГц\n", FREQ_UP / 1e6);
+    printf("  bpsk|qpsk - модуляция передатчика, по умолчанию bpsk\n");
     printf("Примеры:\n");
     printf("  %s tx usb:1.3.5 down   # SDR №1 передает на %.0f МГц\n", argv[0], FREQ_DOWN / 1e6);
     printf("  %s rx usb:1.5.5 down   # SDR №2 принимает на %.0f МГц\n", argv[0], FREQ_DOWN / 1e6);
-    printf("  %s tx usb:1.5.5 up     # SDR №2 передает на %.0f МГц\n", argv[0], FREQ_UP / 1e6);
+    printf("  %s tx usb:1.5.5 up qpsk  # SDR №2 передает QPSK на %.0f МГц\n", argv[0], FREQ_UP / 1e6);
     printf("  %s rx usb:1.3.5 up     # SDR №1 принимает на %.0f МГц\n", argv[0], FREQ_UP / 1e6);
     return 1;
   }
@@ -297,9 +314,20 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  // Модуляция нужна только передатчику, приемник пишет сырые I/Q
+  bool qpsk = false;
+  if (argc > 4) {
+    if (strcmp(argv[4], "qpsk") == 0) {
+      qpsk = true;
+    } else if (strcmp(argv[4], "bpsk") != 0) {
+      printf("Ошибка модуляции: %s (ожидается bpsk или qpsk)\n", argv[4]);
+      return 1;
+    }
+  }
+
   signal(SIGINT, on_sigint);
   if (strcmp(argv[1], "rx") == 0){return run_rx(uri, freq, filename);}
-  else if (strcmp(argv[1], "tx") == 0) {return run_tx(uri, freq, freq_other);}
+  else if (strcmp(argv[1], "tx") == 0) {return run_tx(uri, freq, freq_other, qpsk);}
   else {
     printf("Ошибка режима работы\n");
     return 1;
