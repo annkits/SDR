@@ -1,5 +1,8 @@
 import os
+import socket
 import sys
+import threading
+import time
 
 import numpy as np
 from imgui_bundle import imgui, immapp, implot
@@ -10,6 +13,10 @@ PREAMBLE = np.array([1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1], dtype=np.uint8)  # 
 MAX_POINTS = 4000         # сколько точек рисовать на графике амплитуды (остальное прореживается)
 MAX_MARKS = 200           # сколько меток пакетов рисовать
 MAX_SYMBOLS = 50000       # сколько символов рисовать на созвездии
+
+# Режим live: сэмплы приходят от ./main rx по UDP (порты как в main.cpp)
+UDP_PORTS = {"down": 5555, "up": 5556}
+LIVE_SAMPLES = 200000     # длина кольцевого буфера, отсчетов (200 мс)
 
 MODULATIONS = ("Авто", "BPSK", "QPSK")
 # Идеальные точки созвездий при единичной средней мощности
@@ -44,6 +51,45 @@ def load(name):
     data = np.fromfile(name, dtype='<i2').astype(np.float32)
     n = len(data) // 2
     return data[0:2 * n:2] + 1j * data[1:2 * n:2]
+
+
+class Receiver:
+    # Прием UDP-датаграмм в отдельном потоке и запись в кольцевой буфер.
+    # GUI забирает копию последних LIVE_SAMPLES отсчетов через snapshot()
+    def __init__(self, port, size=LIVE_SAMPLES):
+        self.port = port
+        self.buf = np.zeros(size, dtype=np.complex64)
+        self.samples = 0          # всего принято отсчетов
+        self.datagrams = 0
+        self.lock = threading.Lock()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Запас на случай, когда GUI надолго занял процессор
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+        self.sock.bind(("127.0.0.1", port))
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self):
+        while True:
+            data = self.sock.recv(65536)
+            # Формат как в файле: int16 little-endian I, Q, I, Q, ...
+            raw = np.frombuffer(data, dtype='<i2')
+            n = len(raw) // 2
+            x = raw[0:2 * n:2] + 1j * raw[1:2 * n:2].astype(np.float32)
+            size = len(self.buf)
+            with self.lock:
+                idx = (self.samples + np.arange(n)) % size
+                self.buf[idx] = x
+                self.samples += n
+                self.datagrams += 1
+
+    def snapshot(self):
+        # Последние отсчеты по порядку, от старых к новым
+        with self.lock:
+            size = len(self.buf)
+            if self.samples < size:
+                return self.buf[:self.samples].copy()
+            i = self.samples % size
+            return np.concatenate((self.buf[i:], self.buf[:i]))
 
 
 def find_packets(complex_signal, amplitude, sps, win, margin):
@@ -158,8 +204,9 @@ def decimate(y, i0, i1):
 
 
 class App:
-    def __init__(self, path, modulation="Авто"):
+    def __init__(self, path, modulation="Авто", receiver=None):
         self.path = path
+        self.receiver = receiver  # None - файл, иначе прием по UDP
         self.error = ""
         self.signal = None
         self.amplitude = None
@@ -180,7 +227,17 @@ class App:
         self.detected = None      # (модуляция или None, m2, m4)
         self.only_visible = True  # только пакеты, видимые на графике амплитуды
 
-        self.load()
+        # Режим live
+        self.paused = False
+        self.period = 200         # период обновления, мс
+        self.last_update = 0.0
+        self.last_samples = 0
+        self.rate = 0.0           # скорость приема, отсчетов/с
+        self.rate_t = time.monotonic()
+        self.rate_n = 0
+
+        if receiver is None:
+            self.load()
 
     def modulation(self):
         # Выбранная вручную или определенная автоматически модуляция
@@ -190,20 +247,37 @@ class App:
 
     def load(self):
         try:
-            self.signal = load(self.path)
+            signal = load(self.path)
         except OSError as e:
             self.signal = None
             self.error = str(e)
             return
-        if len(self.signal) == 0:
+        if len(signal) == 0:
             self.signal = None
             self.error = "Файл пустой"
             return
-        self.error = ""
-        self.amplitude = np.abs(self.signal)
-        self.result = None
+        self.set_signal(signal)
         self.go_to_max()
+
+    def set_signal(self, signal):
+        self.error = ""
+        self.signal = signal
+        self.amplitude = np.abs(signal)
         self.find()
+
+    def update_live(self):
+        # Раз в self.period мс: копия кольцевого буфера и повторный поиск пакетов
+        now = time.monotonic()
+        if self.paused or now - self.last_update < self.period / 1e3:
+            return
+        if self.receiver.samples == self.last_samples:
+            return
+        self.last_update = now
+        self.last_samples = self.receiver.samples
+        first = self.signal is None
+        self.set_signal(self.receiver.snapshot())
+        if first:
+            self.view = (0.0, len(self.signal) * 1e3 / FS)
 
     def find(self):
         self.result = find_packets(self.signal, self.amplitude,
@@ -226,7 +300,7 @@ class App:
     def go_to_max(self):
         self.set_view(int(np.argmax(self.amplitude)))
 
-    def settings(self):
+    def file_settings(self):
         imgui.separator_text("Файл")
         for ch in ("down", "up"):
             if imgui.button(ch):
@@ -238,6 +312,29 @@ class App:
         _, self.path = imgui.input_text("##path", self.path)
         if imgui.button("Загрузить"):
             self.load()
+
+    def live_settings(self):
+        r = self.receiver
+        now = time.monotonic()
+        if now - self.rate_t >= 1.0:
+            self.rate = (r.samples - self.rate_n) / (now - self.rate_t)
+            self.rate_t, self.rate_n = now, r.samples
+        imgui.separator_text("Прием (live)")
+        imgui.text(f"UDP 127.0.0.1:{r.port}")
+        imgui.text(f"Принято: {r.samples / FS:.1f} с, датаграмм: {r.datagrams}")
+        imgui.text(f"Скорость: {self.rate / 1e3:.0f} тыс. отсч./с")
+        if self.rate == 0:
+            imgui.text_colored(imgui.ImVec4(1, 0.8, 0.3, 1), "Нет данных: запущен ./main rx?")
+        _, self.paused = imgui.checkbox("Пауза", self.paused)
+        imgui.set_next_item_width(-1)
+        _, self.period = imgui.slider_int("##period", self.period, 50, 2000,
+                                          "обновление %d мс")
+
+    def settings(self):
+        if self.receiver is None:
+            self.file_settings()
+        else:
+            self.live_settings()
         if self.error:
             imgui.text_colored(imgui.ImVec4(1, 0.4, 0.4, 1), self.error)
         if self.signal is None:
@@ -386,6 +483,8 @@ class App:
         self.constellation_plot()
 
     def gui(self):
+        if self.receiver is not None:
+            self.update_live()
         imgui.begin_child("settings", imgui.ImVec2(320, 0),
                           imgui.ChildFlags_.borders | imgui.ChildFlags_.resize_x)
         self.settings()
@@ -397,16 +496,33 @@ class App:
 
 
 def main():
-    # Аргументы: канал down/up (файл dev/build/rx_<канал>.pcm) или путь к файлу;
-    # необязательно модуляция bpsk/qpsk, по умолчанию определяется автоматически
-    arg = sys.argv[1] if len(sys.argv) > 1 else "down"
+    # Аргументы: [live] канал down/up (файл dev/build/rx_<канал>.pcm) или путь к файлу;
+    # необязательно модуляция bpsk/qpsk, по умолчанию определяется автоматически.
+    # live - прием от ./main rx по UDP вместо чтения файла
+    args = sys.argv[1:]
+    live = len(args) > 0 and args[0] == "live"
+    if live:
+        args = args[1:]
+    arg = args[0] if args else "down"
     path = channel_path(arg) if arg in ("down", "up") else arg
-    modulation = sys.argv[2].upper() if len(sys.argv) > 2 else "Авто"
+    modulation = args[1].upper() if len(args) > 1 else "Авто"
     if modulation not in MODULATIONS:
-        print(f"Неизвестная модуляция: {sys.argv[2]} (ожидается bpsk или qpsk)")
+        print(f"Неизвестная модуляция: {args[1]} (ожидается bpsk или qpsk)")
         return
-    app = App(path, modulation)
-    immapp.run(gui_function=app.gui, window_title="Приемник BPSK/QPSK",
+    receiver = None
+    title = "Приемник BPSK/QPSK"
+    if live:
+        if arg not in UDP_PORTS:
+            print(f"Для live нужен канал down или up, а не {arg}")
+            return
+        try:
+            receiver = Receiver(UDP_PORTS[arg])
+        except OSError as e:
+            print(f"Не удалось открыть UDP-порт {UDP_PORTS[arg]}: {e}")
+            return
+        title += f" (live, {arg})"
+    app = App(path, modulation, receiver)
+    immapp.run(gui_function=app.gui, window_title=title,
                window_size=(1400, 850), with_implot=True)
 
 

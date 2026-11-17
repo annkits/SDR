@@ -1,5 +1,9 @@
 #include <SoapySDR/Device.h>   // инициализация устройства
 #include <SoapySDR/Formats.h>  // форматы сэмплов
+#include <arpa/inet.h>         // htons, htonl
+#include <netinet/in.h>        // sockaddr_in
+#include <sys/socket.h>        // socket, sendto
+#include <unistd.h>            // close
 #include <signal.h>            // SIGINT
 #include <stdint.h>
 #include <stdio.h>             // printf
@@ -13,6 +17,13 @@ static void on_sigint(int) { running = 0; }
 // Частоты каналов: downlink и uplink
 static const double FREQ_DOWN = 433e6;
 static const double FREQ_UP   = 434e6;
+
+// UDP-порты на localhost: приемник шлет копию сэмплов для read.py live
+static const uint16_t UDP_PORT_DOWN = 5555;
+static const uint16_t UDP_PORT_UP   = 5556;
+// Отсчетов в датаграмме: 360 * 4 = 1440 байт, без IP-фрагментации
+// (фрагментированные датаграммы на loopback в WSL могут теряться)
+static const int UDP_CHUNK = 360;
 
 // Параметры модуляции
 static const size_t SPS = 10;     // отсчетов на символ (1 МГц / 10 = 100 кбод)
@@ -109,7 +120,7 @@ SoapySDRDevice *make_device(const char *uri) {
 }
 
 
-int run_rx(const char *uri, double freq, const char *filename) {
+int run_rx(const char *uri, double freq, const char *filename, uint16_t port) {
   SoapySDRDevice *sdr = make_device(uri);
   if (sdr == NULL) return 1;
 
@@ -155,6 +166,16 @@ int run_rx(const char *uri, double freq, const char *filename) {
     return 1;
   }
 
+  // UDP-сокет для просмотра в реальном времени.
+  // Если read.py live не запущен, датаграммы просто теряются, прием не тормозит
+  int sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0) printf("UDP socket fail, live view disabled\n");
+  struct sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  printf("Live: UDP 127.0.0.1:%u\n", port);
+
   size_t buffers_read = 0;
 
   // Цикл приема
@@ -174,10 +195,17 @@ int run_rx(const char *uri, double freq, const char *filename) {
     printf("Buffer: %zu - Samples: %i, Flags: %i, Time: %lli, TimeDiff: %lli\n",
            buffers_read, sr, flags, timeNs, timeNs - last_time);
     fwrite(rx_buffer, sizeof(int16_t), 2 * sr, file);
+    // Копия буфера в UDP кусками по UDP_CHUNK отсчетов, без ожидания
+    for (int off = 0; sock >= 0 && off < sr; off += UDP_CHUNK) {
+      int n = (sr - off < UDP_CHUNK) ? sr - off : UDP_CHUNK;
+      sendto(sock, rx_buffer + 2 * off, 2 * n * sizeof(int16_t), MSG_DONTWAIT,
+             (struct sockaddr *)&addr, sizeof(addr));
+    }
     last_time = timeNs;
     buffers_read++;
   }
   fclose(file);
+  if (sock >= 0) close(sock);
   free(rx_buffer);
   printf("Saved %zu buffers to %s\n", buffers_read, filename);
 
@@ -305,10 +333,11 @@ int main(int argc, char *argv[]) {
 
   double freq, freq_other;
   const char *filename;
+  uint16_t port;
   if (strcmp(channel, "down") == 0) {
-    freq = FREQ_DOWN; freq_other = FREQ_UP; filename = "rx_down.pcm";
+    freq = FREQ_DOWN; freq_other = FREQ_UP; filename = "rx_down.pcm"; port = UDP_PORT_DOWN;
   } else if (strcmp(channel, "up") == 0) {
-    freq = FREQ_UP; freq_other = FREQ_DOWN; filename = "rx_up.pcm";
+    freq = FREQ_UP; freq_other = FREQ_DOWN; filename = "rx_up.pcm"; port = UDP_PORT_UP;
   } else {
     printf("Ошибка канала: %s (ожидается down или up)\n", channel);
     return 1;
@@ -326,7 +355,7 @@ int main(int argc, char *argv[]) {
   }
 
   signal(SIGINT, on_sigint);
-  if (strcmp(argv[1], "rx") == 0){return run_rx(uri, freq, filename);}
+  if (strcmp(argv[1], "rx") == 0){return run_rx(uri, freq, filename, port);}
   else if (strcmp(argv[1], "tx") == 0) {return run_tx(uri, freq, freq_other, qpsk);}
   else {
     printf("Ошибка режима работы\n");
