@@ -4,6 +4,7 @@
 #include <netinet/in.h>        // sockaddr_in
 #include <sys/socket.h>        // socket, sendto
 #include <unistd.h>            // close
+#include <math.h>              // lround, sqrt
 #include <signal.h>            // SIGINT
 #include <stdint.h>
 #include <stdio.h>             // printf
@@ -27,10 +28,17 @@ static const uint16_t UDP_PORT_UP   = 5556;
 // по нему read.py ставит отсчеты на свое место и видит потери
 static const int UDP_CHUNK = 360;
 
+// Управление по UDP: read.py live шлет на управляющий порт команду
+// "ключ=значение ..." (пустая - только запрос), процесс применяет ее между
+// буферами и отвечает текущими настройками в том же виде.
+// Порт: порт данных канала + 10 для rx, + 20 для tx
+static const uint16_t CTRL_OFFSET_RX = 10;
+static const uint16_t CTRL_OFFSET_TX = 20;
+
 // Параметры модуляции
 static const size_t SPS = 10;     // отсчетов на символ (1 МГц / 10 = 100 кбод)
-static const int16_t AMP = 1500;  // амплитуда, ЦАП 12 бит (до 2047)
-static const int16_t AMP_QPSK = 1061;  // AMP / sqrt(2) по I и Q: та же мощность, что у BPSK
+static const int16_t AMP = 1500;      // амплитуда по умолчанию, ЦАП 12 бит
+static const int16_t AMP_MAX = 2047;  // предел ЦАП
 
 // Преамбула - код Баркера-13
 static const uint8_t PREAMBLE[] = {1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 0, 1};
@@ -63,9 +71,11 @@ static void convolve(const int16_t *x, size_t n, const int16_t *h, size_t h_len,
 //   BPSK - один бит на символ, только I;
 //   QPSK - два бита на символ: первый задает знак I, второй знак Q (код Грея).
 // Генератор сбрасывается в начале пакета, поэтому все пакеты одинаковые.
+// У QPSK амплитуда amp / sqrt(2) по I и Q: та же мощность, что у BPSK.
 // Возвращает количество бит данных.
-static size_t fill_packet(int16_t *buf, size_t n_samples, bool qpsk) {
+static size_t fill_packet(int16_t *buf, size_t n_samples, bool qpsk, int16_t amp) {
   lfsr = PRBS9_SEED;
+  int16_t amp_qpsk = (int16_t)lround(amp / sqrt(2.0));
   size_t n_symbols = n_samples / SPS;
   size_t n_up = n_symbols * SPS;
 
@@ -74,12 +84,12 @@ static size_t fill_packet(int16_t *buf, size_t n_samples, bool qpsk) {
   int16_t *up_q = (int16_t *)calloc(n_up, sizeof(int16_t));
   for (size_t k = 0; k < n_symbols; k++) {
     if (k < PREAMBLE_LEN) {
-      up_i[k * SPS] = bit_level(PREAMBLE[k], AMP);
+      up_i[k * SPS] = bit_level(PREAMBLE[k], amp);
     } else if (qpsk) {
-      up_i[k * SPS] = bit_level(prbs9_next(), AMP_QPSK);
-      up_q[k * SPS] = bit_level(prbs9_next(), AMP_QPSK);
+      up_i[k * SPS] = bit_level(prbs9_next(), amp_qpsk);
+      up_q[k * SPS] = bit_level(prbs9_next(), amp_qpsk);
     } else {
-      up_i[k * SPS] = bit_level(prbs9_next(), AMP);
+      up_i[k * SPS] = bit_level(prbs9_next(), amp);
     }
   }
 
@@ -119,6 +129,114 @@ SoapySDRDevice *make_device(const char *uri) {
     printf("SoapySDRDevice_make fail (%s): %s\n", uri, SoapySDRDevice_lastError());
   }
   return sdr;
+}
+
+// ---------------- Управление по UDP ----------------
+
+static int open_control(uint16_t port) {
+  int sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0) return -1;
+  struct sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    printf("Control: bind UDP %u fail, управление отключено\n", port);
+    close(sock);
+    return -1;
+  }
+  printf("Control: UDP 127.0.0.1:%u\n", port);
+  return sock;
+}
+
+// Одна команда без ожидания: текст в buf, отправитель в from. false - команд нет
+static bool recv_control(int sock, char *buf, size_t size, struct sockaddr_in *from) {
+  if (sock < 0) return false;
+  socklen_t len = sizeof(*from);
+  ssize_t n = recvfrom(sock, buf, size - 1, MSG_DONTWAIT, (struct sockaddr *)from, &len);
+  if (n < 0) return false;
+  buf[n] = 0;
+  return true;
+}
+
+// Следующая пара "ключ=значение" из команды: ключ - возвращаемое значение, NULL - пар больше нет
+static char *next_pair(char **save, char *cmd, char **value) {
+  for (char *tok = strtok_r(cmd, " \n", save); tok; tok = strtok_r(NULL, " \n", save)) {
+    char *eq = strchr(tok, '=');
+    if (eq == NULL) continue;
+    *eq = 0;
+    *value = eq + 1;
+    return tok;
+  }
+  return NULL;
+}
+
+static void reply_control(int sock, const struct sockaddr_in *to, const char *text) {
+  sendto(sock, text, strlen(text), MSG_DONTWAIT, (const struct sockaddr *)to, sizeof(*to));
+}
+
+// Команды приемника: freq (Гц), gain (дБ), agc (0/1 - автоматическая регулировка усиления)
+static void rx_control(SoapySDRDevice *sdr, int sock) {
+  char cmd[512];
+  struct sockaddr_in from;
+  while (recv_control(sock, cmd, sizeof(cmd), &from)) {
+    char *save, *value;
+    for (char *key = next_pair(&save, cmd, &value); key; key = next_pair(&save, NULL, &value)) {
+      printf("Control: %s = %s\n", key, value);
+      if (strcmp(key, "freq") == 0) {
+        SoapySDRDevice_setFrequency(sdr, SOAPY_SDR_RX, 0, atof(value), NULL);
+      } else if (strcmp(key, "gain") == 0) {
+        SoapySDRDevice_setGain(sdr, SOAPY_SDR_RX, 0, atof(value));
+      } else if (strcmp(key, "agc") == 0) {
+        SoapySDRDevice_setGainMode(sdr, SOAPY_SDR_RX, 0, atoi(value) != 0);
+      }
+    }
+    SoapySDRRange g = SoapySDRDevice_getGainRange(sdr, SOAPY_SDR_RX, 0);
+    char reply[256];
+    snprintf(reply, sizeof(reply), "role=rx freq=%.0f gain=%.1f gain_min=%.1f gain_max=%.1f agc=%d",
+             SoapySDRDevice_getFrequency(sdr, SOAPY_SDR_RX, 0),
+             SoapySDRDevice_getGain(sdr, SOAPY_SDR_RX, 0), g.minimum, g.maximum,
+             SoapySDRDevice_getGainMode(sdr, SOAPY_SDR_RX, 0) ? 1 : 0);
+    reply_control(sock, &from, reply);
+  }
+}
+
+// Команды передатчика: freq (Гц), gain (дБ), amp (0..AMP_MAX), mod (bpsk/qpsk).
+// При смене амплитуды или модуляции пакет tx_on собирается заново
+static void tx_control(SoapySDRDevice *sdr, int sock, int16_t *tx_on, size_t tx_mtu,
+                       int16_t *amp, bool *qpsk) {
+  char cmd[512];
+  struct sockaddr_in from;
+  while (recv_control(sock, cmd, sizeof(cmd), &from)) {
+    bool refill = false;
+    char *save, *value;
+    for (char *key = next_pair(&save, cmd, &value); key; key = next_pair(&save, NULL, &value)) {
+      printf("Control: %s = %s\n", key, value);
+      if (strcmp(key, "freq") == 0) {
+        SoapySDRDevice_setFrequency(sdr, SOAPY_SDR_TX, 0, atof(value), NULL);
+      } else if (strcmp(key, "gain") == 0) {
+        SoapySDRDevice_setGain(sdr, SOAPY_SDR_TX, 0, atof(value));
+      } else if (strcmp(key, "amp") == 0) {
+        int a = atoi(value);
+        *amp = (int16_t)(a < 0 ? 0 : a > AMP_MAX ? AMP_MAX : a);
+        refill = true;
+      } else if (strcmp(key, "mod") == 0) {
+        if (strcmp(value, "qpsk") == 0 || strcmp(value, "bpsk") == 0) {
+          *qpsk = strcmp(value, "qpsk") == 0;
+          refill = true;
+        }
+      }
+    }
+    if (refill) fill_packet(tx_on, tx_mtu, *qpsk, *amp);
+    SoapySDRRange g = SoapySDRDevice_getGainRange(sdr, SOAPY_SDR_TX, 0);
+    char reply[256];
+    snprintf(reply, sizeof(reply),
+             "role=tx freq=%.0f gain=%.1f gain_min=%.1f gain_max=%.1f amp=%d amp_max=%d mod=%s",
+             SoapySDRDevice_getFrequency(sdr, SOAPY_SDR_TX, 0),
+             SoapySDRDevice_getGain(sdr, SOAPY_SDR_TX, 0), g.minimum, g.maximum,
+             *amp, AMP_MAX, *qpsk ? "qpsk" : "bpsk");
+    reply_control(sock, &from, reply);
+  }
 }
 
 
@@ -177,6 +295,7 @@ int run_rx(const char *uri, double freq, const char *filename, uint16_t port) {
   addr.sin_port = htons(port);
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   printf("Live: UDP 127.0.0.1:%u\n", port);
+  int ctrl = open_control(port + CTRL_OFFSET_RX);
 
   size_t buffers_read = 0;
   uint64_t samples_read = 0;  // номер первого отсчета текущего буфера
@@ -211,9 +330,11 @@ int run_rx(const char *uri, double freq, const char *filename, uint16_t port) {
     samples_read += sr;
     last_time = timeNs;
     buffers_read++;
+    rx_control(sdr, ctrl);  // команды read.py live, если пришли
   }
   fclose(file);
   if (sock >= 0) close(sock);
+  if (ctrl >= 0) close(ctrl);
   free(rx_buffer);
   printf("Saved %zu buffers to %s\n", buffers_read, filename);
 
@@ -226,7 +347,7 @@ int run_rx(const char *uri, double freq, const char *filename, uint16_t port) {
   return 0;
 }
 
-int run_tx(const char *uri, double freq_tx, double freq_rx, bool qpsk) {
+int run_tx(const char *uri, double freq_tx, double freq_rx, bool qpsk, uint16_t port) {
   SoapySDRDevice *sdr = make_device(uri);
   if (sdr == NULL) return 1;
 
@@ -265,7 +386,8 @@ int run_tx(const char *uri, double freq_tx, double freq_rx, bool qpsk) {
   // Метку времени в начало буфера драйвер ставит сам по tx_time.
   int16_t *tx_on = (int16_t *)malloc(2 * tx_mtu * sizeof(int16_t));
   int16_t *tx_off = (int16_t *)calloc(2 * tx_mtu, sizeof(int16_t));
-  size_t data_bits = fill_packet(tx_on, tx_mtu, qpsk);
+  int16_t amp = AMP;
+  size_t data_bits = fill_packet(tx_on, tx_mtu, qpsk, amp);
   printf("%s: SPS %zu, symbols per packet %zu (preamble %zu + data %zu), data bits %zu\n",
          qpsk ? "QPSK" : "BPSK", SPS, tx_mtu / SPS, PREAMBLE_LEN,
          tx_mtu / SPS - PREAMBLE_LEN, data_bits);
@@ -277,6 +399,7 @@ int run_tx(const char *uri, double freq_tx, double freq_rx, bool qpsk) {
   const long timeoutUs = 400000;
   long long last_time = 0;
   size_t buffers_read = 0;
+  int ctrl = open_control(port + CTRL_OFFSET_TX);
 
   // Цикл передачи
   while (running) {
@@ -305,8 +428,10 @@ int run_tx(const char *uri, double freq_tx, double freq_rx, bool qpsk) {
       printf("buffers sent: %zu\n", buffers_read);
     }
     buffers_read++;
+    tx_control(sdr, ctrl, tx_on, tx_mtu, &amp, &qpsk);  // команды read.py live
   }
 
+  if (ctrl >= 0) close(ctrl);
   free(tx_on);
   free(tx_off);
   free(rx_buffer);
@@ -364,7 +489,7 @@ int main(int argc, char *argv[]) {
 
   signal(SIGINT, on_sigint);
   if (strcmp(argv[1], "rx") == 0){return run_rx(uri, freq, filename, port);}
-  else if (strcmp(argv[1], "tx") == 0) {return run_tx(uri, freq, freq_other, qpsk);}
+  else if (strcmp(argv[1], "tx") == 0) {return run_tx(uri, freq, freq_other, qpsk, port);}
   else {
     printf("Ошибка режима работы\n");
     return 1;
