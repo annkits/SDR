@@ -8,7 +8,7 @@
 #include <stdint.h>
 #include <stdio.h>             // printf
 #include <stdlib.h>            // malloc, free
-#include <string.h>            // strcmp
+#include <string.h>            // strcmp, memcpy
 
 // Флаг остановки по Ctrl+C
 static volatile sig_atomic_t running = 1;
@@ -21,8 +21,10 @@ static const double FREQ_UP   = 434e6;
 // UDP-порты на localhost: приемник шлет копию сэмплов для read.py live
 static const uint16_t UDP_PORT_DOWN = 5555;
 static const uint16_t UDP_PORT_UP   = 5556;
-// Отсчетов в датаграмме: 360 * 4 = 1440 байт, без IP-фрагментации
-// (фрагментированные датаграммы на loopback в WSL могут теряться)
+// Отсчетов в датаграмме: 8 + 360 * 4 = 1448 байт, без IP-фрагментации
+// (фрагментированные датаграммы на loopback в WSL могут теряться).
+// В начале датаграммы uint64 - номер ее первого отсчета с начала приема,
+// по нему read.py ставит отсчеты на свое место и видит потери
 static const int UDP_CHUNK = 360;
 
 // Параметры модуляции
@@ -177,6 +179,8 @@ int run_rx(const char *uri, double freq, const char *filename, uint16_t port) {
   printf("Live: UDP 127.0.0.1:%u\n", port);
 
   size_t buffers_read = 0;
+  uint64_t samples_read = 0;  // номер первого отсчета текущего буфера
+  int16_t dgram[4 + 2 * UDP_CHUNK];
 
   // Цикл приема
   while (running) {
@@ -198,9 +202,13 @@ int run_rx(const char *uri, double freq, const char *filename, uint16_t port) {
     // Копия буфера в UDP кусками по UDP_CHUNK отсчетов, без ожидания
     for (int off = 0; sock >= 0 && off < sr; off += UDP_CHUNK) {
       int n = (sr - off < UDP_CHUNK) ? sr - off : UDP_CHUNK;
-      sendto(sock, rx_buffer + 2 * off, 2 * n * sizeof(int16_t), MSG_DONTWAIT,
+      uint64_t pos = samples_read + off;
+      memcpy(dgram, &pos, sizeof(pos));
+      memcpy(dgram + 4, rx_buffer + 2 * off, 2 * n * sizeof(int16_t));
+      sendto(sock, dgram, sizeof(pos) + 2 * n * sizeof(int16_t), MSG_DONTWAIT,
              (struct sockaddr *)&addr, sizeof(addr));
     }
+    samples_read += sr;
     last_time = timeNs;
     buffers_read++;
   }

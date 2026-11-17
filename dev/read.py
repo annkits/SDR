@@ -16,7 +16,10 @@ MAX_SYMBOLS = 50000       # сколько символов рисовать н�
 
 # Режим live: сэмплы приходят от ./main rx по UDP (порты как в main.cpp)
 UDP_PORTS = {"down": 5555, "up": 5556}
-LIVE_SAMPLES = 200000     # длина кольцевого буфера, отсчетов (200 мс)
+UDP_HEADER = 8            # uint64 в начале датаграммы: номер ее первого отсчета
+LIVE_SAMPLES = 500000     # длина кольцевого буфера, отсчетов (500 мс)
+LIVE_LAG = 100000         # отставание правого края графика от приема, отсчетов (100 мс):
+                          # запас на то, что отсчеты приходят пачками
 
 MODULATIONS = ("Авто", "BPSK", "QPSK")
 # Идеальные точки созвездий при единичной средней мощности
@@ -55,12 +58,16 @@ def load(name):
 
 class Receiver:
     # Прием UDP-датаграмм в отдельном потоке и запись в кольцевой буфер.
+    # Отсчет с номером k (с начала приема в ./main rx) лежит в buf[k % size],
     # GUI забирает копию последних LIVE_SAMPLES отсчетов через snapshot()
     def __init__(self, port, size=LIVE_SAMPLES):
         self.port = port
         self.buf = np.zeros(size, dtype=np.complex64)
-        self.samples = 0          # всего принято отсчетов
+        self.samples = 0          # номер отсчета, следующего за последним принятым
+        self.received = 0         # всего принято отсчетов
+        self.lost = 0             # пропущено отсчетов (потерянные датаграммы)
         self.datagrams = 0
+        self.restarts = 0         # сколько раз ./main rx перезапускался
         self.lock = threading.Lock()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # Запас на случай, когда GUI надолго занял процессор
@@ -71,25 +78,38 @@ class Receiver:
     def run(self):
         while True:
             data = self.sock.recv(65536)
-            # Формат как в файле: int16 little-endian I, Q, I, Q, ...
-            raw = np.frombuffer(data, dtype='<i2')
+            if len(data) < UDP_HEADER:
+                continue
+            pos = int(np.frombuffer(data, dtype='<u8', count=1)[0])
+            # Дальше как в файле: int16 little-endian I, Q, I, Q, ...
+            raw = np.frombuffer(data, dtype='<i2', offset=UDP_HEADER)
             n = len(raw) // 2
             x = raw[0:2 * n:2] + 1j * raw[1:2 * n:2].astype(np.float32)
             size = len(self.buf)
             with self.lock:
-                idx = (self.samples + np.arange(n)) % size
-                self.buf[idx] = x
-                self.samples += n
+                if pos + n <= self.samples - size:
+                    # Номер меньше, чем помещается в буфер: ./main rx запущен заново
+                    self.buf[:] = 0
+                    self.samples = 0
+                    self.restarts += 1
+                if pos > self.samples:
+                    # Датаграммы потерялись: на их месте нули, а не старые отсчеты
+                    gap = pos - self.samples
+                    self.buf[(self.samples + np.arange(min(gap, size))) % size] = 0
+                    self.lost += gap
+                self.buf[(pos + np.arange(n)) % size] = x
+                self.samples = max(self.samples, pos + n)
+                self.received += n
                 self.datagrams += 1
 
     def snapshot(self):
-        # Последние отсчеты по порядку, от старых к новым
+        # (номер первого отсчета, последние отсчеты по порядку от старых к новым)
         with self.lock:
             size = len(self.buf)
             if self.samples < size:
-                return self.buf[:self.samples].copy()
+                return 0, self.buf[:self.samples].copy()
             i = self.samples % size
-            return np.concatenate((self.buf[i:], self.buf[:i]))
+            return self.samples - size, np.concatenate((self.buf[i:], self.buf[:i]))
 
 
 def find_packets(complex_signal, amplitude, sps, win, margin):
@@ -104,6 +124,8 @@ def find_packets(complex_signal, amplitude, sps, win, margin):
     lo, hi = np.percentile(env, [5, 95])
     above = env > (lo + hi) / 2
     rises = np.flatnonzero(above[1:] & ~above[:-1]) + 1
+    # Доля отсчетов выше порога на любом отрезке - через накопленную сумму
+    above_sum = np.concatenate(([0], np.cumsum(above)))
 
     starts = []
     taus = []
@@ -115,7 +137,7 @@ def find_packets(complex_signal, amplitude, sps, win, margin):
             continue
         if r < margin or r + BUFFER + margin > len(complex_signal):
             continue
-        if above[r:r + BUFFER].mean() < 0.8:  # выброс шума
+        if above_sum[r + BUFFER] - above_sum[r] < 0.8 * BUFFER:  # выброс шума
             continue
         seg = complex_signal[r - margin:r + BUFFER + margin]
 
@@ -186,17 +208,18 @@ def bit_errors(symbols, modulation):
     return np.sum(bits != prbs9(bits.shape[1])[None, :], axis=1)
 
 
-def decimate(y, i0, i1):
+def decimate(y, i0, i1, offset=0):
     # Отсчеты [i0, i1) для графика: если их больше MAX_POINTS,
-    # каждую группу заменяем парой min/max, чтобы не терять пики
+    # каждую группу заменяем парой min/max, чтобы не терять пики.
+    # offset - номер отсчета y[0], время по оси считается от него
     seg = y[i0:i1]
     step = max(1, len(seg) // (MAX_POINTS // 2))
     if step == 1:
-        x = np.arange(i0, i1, dtype=np.float64)
+        x = offset + np.arange(i0, i1, dtype=np.float64)
         return x * 1e3 / FS, seg.astype(np.float64)
     n = len(seg) // step
     blk = seg[:n * step].reshape(n, step)
-    x = np.repeat(i0 + np.arange(n, dtype=np.float64) * step, 2)
+    x = np.repeat(offset + i0 + np.arange(n, dtype=np.float64) * step, 2)
     ys = np.empty(2 * n)
     ys[0::2] = blk.min(axis=1)
     ys[1::2] = blk.max(axis=1)
@@ -210,6 +233,7 @@ class App:
         self.error = ""
         self.signal = None
         self.amplitude = None
+        self.offset = 0           # номер отсчета signal[0] (в live - с начала приема)
         self.view = None          # (t0, t1) в мс, применяется на следующем кадре
         self.window = 20000       # ширина окна просмотра, отсчетов
         self.cur = (0.0, 0.0)     # видимый диапазон, мс
@@ -229,15 +253,23 @@ class App:
 
         # Режим live
         self.paused = False
-        self.period = 200         # период обновления, мс
-        self.last_update = 0.0
+        self.period = 200         # период поиска пакетов, мс
+        self.force_find = False   # найти пакеты сразу, не дожидаясь периода
+        self.ymax = 0.0           # предел оси амплитуды, чтобы она не прыгала
+        self.play = 0.0           # правый край графика, номер отсчета
+        self.restarts = 0
         self.last_samples = 0
+        self.last_data = 0.0      # когда последний раз пришли новые отсчеты
         self.rate = 0.0           # скорость приема, отсчетов/с
         self.rate_t = time.monotonic()
         self.rate_n = 0
+        self.pending = None       # результат поиска из фонового потока
+        self.pending_lock = threading.Lock()
 
         if receiver is None:
             self.load()
+        else:
+            threading.Thread(target=self.live_worker, daemon=True).start()
 
     def modulation(self):
         # Выбранная вручную или определенная автоматически модуляция
@@ -265,23 +297,79 @@ class App:
         self.amplitude = np.abs(signal)
         self.find()
 
+    def live_worker(self):
+        # Фоновый поток: раз в self.period мс ищет пакеты в копии кольцевого буфера,
+        # чтобы поиск не задерживал отрисовку кадров
+        last = 0.0
+        searched = -1
+        while True:
+            time.sleep(0.01)
+            r = self.receiver
+            due = time.monotonic() - last >= self.period / 1e3
+            if not self.force_find and (self.paused or not due or r.samples == searched):
+                continue
+            self.force_find = False
+            last = time.monotonic()
+            searched = r.samples
+            offset, signal = r.snapshot()
+            if len(signal) < BUFFER:
+                continue
+            amplitude = np.abs(signal)
+            result = find_packets(signal, amplitude, self.sps, self.win, self.margin)
+            result["starts"] += offset
+            symbols = result["symbols"]
+            detected = detect_modulation(symbols) if len(symbols) else None
+            with self.pending_lock:
+                self.pending = (result, detected, float(amplitude.max()))
+
     def update_live(self):
-        # Раз в self.period мс: копия кольцевого буфера и повторный поиск пакетов
+        # Каждый кадр: свежие отсчеты из кольцевого буфера и плавный сдвиг окна
+        r = self.receiver
         now = time.monotonic()
-        if self.paused or now - self.last_update < self.period / 1e3:
+        dt = imgui.get_io().delta_time
+        if r.restarts != self.restarts:
+            # ./main rx перезапущен, номера отсчетов начались с нуля
+            self.restarts = r.restarts
+            self.play = 0.0
+            self.result = None
+            self.detected = None
+        with self.pending_lock:
+            pending, self.pending = self.pending, None
+        if pending is not None and not self.paused:
+            self.result, self.detected, ymax = pending
+            self.errors = {}
+            self.ymax = 1.1 * ymax
+        if self.paused:
             return
-        if self.receiver.samples == self.last_samples:
+        if r.samples != self.last_samples:
+            self.last_samples = r.samples
+            self.last_data = now
+            self.offset, self.signal = r.snapshot()
+            self.amplitude = np.abs(self.signal)
+        if self.signal is None:
             return
-        self.last_update = now
-        self.last_samples = self.receiver.samples
-        first = self.signal is None
-        self.set_signal(self.receiver.snapshot())
-        if first:
-            self.view = (0.0, len(self.signal) * 1e3 / FS)
+
+        # Правый край графика идет равномерно со скоростью FS и плавно
+        # подтягивается к принятому минус LIVE_LAG: отсчеты приходят пачками,
+        # и если привязать край прямо к ним, график будет дергаться
+        target = r.samples - LIVE_LAG
+        if now - self.last_data < 0.15:
+            self.play += dt * FS
+        err = target - self.play
+        if abs(err) > 2 * LIVE_LAG:
+            self.play = target    # сильно отстали или убежали - прыжок
+        else:
+            self.play += err * min(1.0, 2 * dt)
+        self.window = min(self.window, LIVE_SAMPLES - LIVE_LAG)
+        self.view = ((self.play - self.window) * 1e3 / FS, self.play * 1e3 / FS)
 
     def find(self):
+        if self.receiver is not None and not self.paused:
+            self.force_find = True    # live: поиск в фоновом потоке
+            return
         self.result = find_packets(self.signal, self.amplitude,
                                    self.sps, self.win, self.margin)
+        self.result["starts"] += self.offset
         symbols = self.result["symbols"]
         self.detected = detect_modulation(symbols) if len(symbols) else None
         self.errors = {}          # модуляция -> ошибки по пакетам
@@ -294,11 +382,11 @@ class App:
 
     def set_view(self, center):
         # Окно ширины self.window вокруг отсчета center
-        start = max(0, center - self.window // 2)
+        start = max(self.offset, center - self.window // 2)
         self.view = (start * 1e3 / FS, (start + self.window) * 1e3 / FS)
 
     def go_to_max(self):
-        self.set_view(int(np.argmax(self.amplitude)))
+        self.set_view(self.offset + int(np.argmax(self.amplitude)))
 
     def file_settings(self):
         imgui.separator_text("Файл")
@@ -317,18 +405,19 @@ class App:
         r = self.receiver
         now = time.monotonic()
         if now - self.rate_t >= 1.0:
-            self.rate = (r.samples - self.rate_n) / (now - self.rate_t)
-            self.rate_t, self.rate_n = now, r.samples
+            self.rate = (r.received - self.rate_n) / (now - self.rate_t)
+            self.rate_t, self.rate_n = now, r.received
         imgui.separator_text("Прием (live)")
         imgui.text(f"UDP 127.0.0.1:{r.port}")
-        imgui.text(f"Принято: {r.samples / FS:.1f} с, датаграмм: {r.datagrams}")
+        imgui.text(f"Принято: {r.received / FS:.1f} с, датаграмм: {r.datagrams}")
         imgui.text(f"Скорость: {self.rate / 1e3:.0f} тыс. отсч./с")
+        imgui.text(f"Потеряно: {r.lost} отсч. ({100 * r.lost / max(1, r.samples):.2f} %)")
         if self.rate == 0:
             imgui.text_colored(imgui.ImVec4(1, 0.8, 0.3, 1), "Нет данных: запущен ./main rx?")
-        _, self.paused = imgui.checkbox("Пауза", self.paused)
+        _, self.paused = imgui.checkbox("Пауза (можно двигать график)", self.paused)
         imgui.set_next_item_width(-1)
         _, self.period = imgui.slider_int("##period", self.period, 50, 2000,
-                                          "обновление %d мс")
+                                          "поиск пакетов раз в %d мс")
 
     def settings(self):
         if self.receiver is None:
@@ -345,13 +434,14 @@ class App:
 
         imgui.separator_text("Вид")
         imgui.set_next_item_width(-1)
-        _, self.window = imgui.slider_int("##window", self.window, 1000, 2000000,
+        max_window = 2000000 if self.receiver is None else LIVE_SAMPLES - LIVE_LAG
+        _, self.window = imgui.slider_int("##window", self.window, 1000, max_window,
                                           "окно %d отсч.", imgui.SliderFlags_.logarithmic)
         if imgui.button("К максимуму"):
             self.go_to_max()
         imgui.same_line()
-        if imgui.button("Весь файл"):
-            self.view = (0.0, len(self.signal) * 1e3 / FS)
+        if imgui.button("Весь файл" if self.receiver is None else "Весь буфер"):
+            self.view = (self.offset * 1e3 / FS, (self.offset + len(self.signal)) * 1e3 / FS)
         _, self.show_marks = imgui.checkbox("Начала пакетов", self.show_marks)
         _, self.show_threshold = imgui.checkbox("Порог детектора", self.show_threshold)
 
@@ -422,23 +512,29 @@ class App:
         n = len(self.signal)
         if not implot.begin_plot("Амплитуда", imgui.ImVec2(-1, height)):
             return
-        implot.setup_axes("Время, мс", "|I + jQ|", 0, implot.AxisFlags_.auto_fit)
+        live = self.receiver is not None
+        # В live ось амплитуды фиксирована по всему буферу: подгонка по видимой
+        # части меняла бы масштаб в каждом кадре
+        implot.setup_axes("Время, мс", "|I + jQ|", 0,
+                          0 if live else implot.AxisFlags_.auto_fit)
+        if live and not self.paused and self.ymax > 0:
+            implot.setup_axis_limits(implot.ImAxis_.y1, 0, self.ymax, imgui.Cond_.always)
         if self.view is not None:
             implot.setup_axis_limits(implot.ImAxis_.x1, *self.view, imgui.Cond_.always)
             self.view = None
         lim = implot.get_plot_limits().x
         self.cur = (lim.min, lim.max)
-        # Рисуем только видимую часть файла
-        i0 = int(np.clip(lim.min * FS / 1e3, 0, n))
-        i1 = int(np.clip(lim.max * FS / 1e3 + 2, 0, n))
+        # Рисуем только видимую часть сигнала; номера отсчетов считаются от self.offset
+        i0 = int(np.clip(lim.min * FS / 1e3 - self.offset, 0, n))
+        i1 = int(np.clip(lim.max * FS / 1e3 + 2 - self.offset, 0, n))
         if i1 > i0:
-            implot.plot_line("|I + jQ|", *decimate(self.amplitude, i0, i1))
+            implot.plot_line("|I + jQ|", *decimate(self.amplitude, i0, i1, self.offset))
         if self.result is not None:
             if self.show_threshold:
                 implot.plot_inf_lines("Порог", np.array([self.result["threshold"]]),
                                       implot.Spec(flags=implot.InfLinesFlags_.horizontal))
             starts = self.result["starts"]
-            vis = starts[(starts >= i0) & (starts < i1)]
+            vis = starts[(starts >= self.offset + i0) & (starts < self.offset + i1)]
             if self.show_marks and 0 < len(vis) <= MAX_MARKS:
                 implot.plot_inf_lines("Начало пакета", vis * 1e3 / FS)
         implot.end_plot()
@@ -453,7 +549,9 @@ class App:
         step = max(1, len(symbols) // MAX_SYMBOLS)
         symbols = symbols[::step]
 
-        if not implot.begin_plot(f"Созвездие ({len(symbols)} симв.)",
+        # После ### - постоянный ID: иначе при каждом изменении числа символов
+        # ImPlot создает новый график и сбрасывает масштаб
+        if not implot.begin_plot(f"Созвездие ({len(symbols)} симв.)###constellation",
                                  imgui.ImVec2(-1, -1), implot.Flags_.equal):
             return
         implot.setup_axes("I", "Q")
@@ -522,8 +620,11 @@ def main():
             return
         title += f" (live, {arg})"
     app = App(path, modulation, receiver)
+    # В live кадры рисуются всегда: по умолчанию без движения мыши
+    # окно переходит на 10 кадров/с, и прокрутка дергается
     immapp.run(gui_function=app.gui, window_title=title,
-               window_size=(1400, 850), with_implot=True)
+               window_size=(1400, 850), with_implot=True,
+               fps_idle=0 if live else 10)
 
 
 if __name__ == "__main__":
