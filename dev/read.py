@@ -43,6 +43,8 @@ BAD = imgui.ImVec4(0.96, 0.42, 0.42, 1)
 MARK = imgui.ImVec4(0.42, 0.82, 0.48, 0.65)
 # в старых imgui-bundle флаг рамки называется border, в новых — borders
 CHILD_BORDERS = getattr(imgui.ChildFlags_, "borders", None) or imgui.ChildFlags_.border
+# imgui до 1.92 загружает из шрифта только латиницу, кириллица выводится как "?"
+OLD_FONTS = tuple(int(x) for x in imgui.get_version().split(".")[:2]) < (1, 92)
 IDEAL_COLOR = imgui.ImVec4(1.00, 0.55, 0.20, 1)
 GREY = imgui.ImVec4(0.5, 0.5, 0.5, 1)
 
@@ -1007,6 +1009,14 @@ class App:
         imgui.end_child()
 
 
+def load_fonts():
+    """Шрифт по умолчанию hello_imgui, но со всеми символами, включая кириллицу."""
+    font_params = hello_imgui.FontLoadingParams()
+    font_params.use_full_glyph_range = True
+    font_params.merge_font_awesome = True
+    hello_imgui.load_font("fonts/DroidSans.ttf", 15.0, font_params)
+
+
 def main():
     # Аргументы: [live] канал down/up (файл dev/build/rx_<канал>.pcm) или путь к файлу;
     # необязательно модуляция bpsk/qpsk, по умолчанию определяется автоматически.
@@ -1034,11 +1044,18 @@ def main():
             return
         title += f" (live, {arg})"
     app = App(path, modulation, receiver)
+    params = hello_imgui.RunnerParams()
+    params.callbacks.show_gui = app.gui
+    params.app_window_params.window_title = title
+    params.app_window_params.window_geometry.size = (1400, 850)
     # В live кадры рисуются всегда: по умолчанию без движения мыши
     # окно переходит на 10 кадров/с, и прокрутка дергается
-    immapp.run(gui_function=app.gui, window_title=title,
-               window_size=(1400, 850), with_implot=True,
-               fps_idle=0 if live else 10)
+    params.fps_idling.fps_idle = 0 if live else 10
+    if OLD_FONTS:
+        params.callbacks.load_additional_fonts = load_fonts
+    addons = immapp.AddOnsParams()
+    addons.with_implot = True
+    immapp.run(params, addons)
 
 
 if __name__ == "__main__":
