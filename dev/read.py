@@ -41,6 +41,8 @@ GOOD = imgui.ImVec4(0.42, 0.82, 0.48, 1)
 WARN = imgui.ImVec4(0.98, 0.76, 0.30, 1)
 BAD = imgui.ImVec4(0.96, 0.42, 0.42, 1)
 MARK = imgui.ImVec4(0.42, 0.82, 0.48, 0.65)
+# в старых imgui-bundle флаг рамки называется border, в новых — borders
+CHILD_BORDERS = getattr(imgui.ChildFlags_, "borders", None) or imgui.ChildFlags_.border
 IDEAL_COLOR = imgui.ImVec4(1.00, 0.55, 0.20, 1)
 GREY = imgui.ImVec4(0.5, 0.5, 0.5, 1)
 
@@ -996,7 +998,7 @@ class App:
             self.update_live()
         self.hotkeys()
         imgui.begin_child("settings", imgui.ImVec2(340, 0),
-                          imgui.ChildFlags_.borders | imgui.ChildFlags_.resize_x)
+                          CHILD_BORDERS | imgui.ChildFlags_.resize_x)
         self.settings()
         imgui.end_child()
         imgui.same_line()
