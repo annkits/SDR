@@ -49,6 +49,40 @@ IDEAL_COLOR = imgui.ImVec4(1.00, 0.55, 0.20, 1)
 GREY = imgui.ImVec4(0.5, 0.5, 0.5, 1)
 
 
+def style(flags=0, **kw):
+    """Стиль элемента графика: implot.Spec в новых imgui-bundle,
+    set_next_*_style + flags в старых (до implot 0.17).
+    Возвращает аргументы для **, вызывать прямо в вызове plot_*."""
+    if hasattr(implot, "Spec"):
+        return {"spec": implot.Spec(flags=flags, **kw)}
+    line = {}
+    if "line_color" in kw:
+        line["col"] = kw["line_color"]
+    if "line_weight" in kw:
+        line["weight"] = kw["line_weight"]
+    if line:
+        implot.set_next_line_style(**line)
+    fill = {}
+    if "fill_color" in kw:
+        fill["col"] = kw["fill_color"]
+    if "fill_alpha" in kw:
+        fill["alpha_mod"] = kw["fill_alpha"]
+    if fill:
+        implot.set_next_fill_style(**fill)
+    if "marker" in kw:
+        marker = {"marker": kw["marker"]}
+        if "marker_size" in kw:
+            marker["size"] = kw["marker_size"]
+        if "marker_fill_color" in kw:
+            marker["fill"] = kw["marker_fill_color"]
+        if "marker_line_color" in kw:
+            marker["outline"] = kw["marker_line_color"]
+        if "line_weight" in kw:
+            marker["weight"] = kw["line_weight"]
+        implot.set_next_marker_style(**marker)
+    return {"flags": flags}
+
+
 # Генератор PRBS-9 как в main.cpp (x^9 + x^5 + 1, сброс в начале каждого пакета)
 PRBS9_SEED = 0x1FF
 
@@ -870,17 +904,17 @@ class App:
         i1 = int(np.clip(lim.max * FS / 1e3 + 2 - self.offset, 0, n))
         if i1 > i0:
             implot.plot_line("|I + jQ|", *decimate(self.amplitude, i0, i1, self.offset),
-                             spec=implot.Spec(line_color=ACCENT))
+                             **style(line_color=ACCENT))
         if self.result is not None:
             if self.show_threshold:
                 implot.plot_inf_lines("Порог", np.array([self.result["threshold"]]),
-                                      implot.Spec(line_color=BAD, line_weight=1.5,
-                                                  flags=implot.InfLinesFlags_.horizontal))
+                                      **style(line_color=BAD, line_weight=1.5,
+                                              flags=implot.InfLinesFlags_.horizontal))
             starts = self.result["starts"]
             vis = starts[(starts >= self.offset + i0) & (starts < self.offset + i1)]
             if self.show_marks and 0 < len(vis) <= MAX_MARKS:
                 implot.plot_inf_lines("Начало пакета", vis * 1e3 / FS,
-                                      implot.Spec(line_color=MARK, line_weight=1.5))
+                                      **style(line_color=MARK, line_weight=1.5))
         implot.end_plot()
 
     def constellation_plot(self):
@@ -902,21 +936,21 @@ class App:
         implot.setup_axes_limits(-1.6, 1.6, -1.6, 1.6, imgui.Cond_.once)
         implot.setup_legend(implot.Location_.north_east)
         # Оси - границы решений для BPSK (по I) и QPSK (по I и Q)
-        implot.plot_inf_lines("##axes_x", np.array([0.0]), implot.Spec(line_color=GREY))
+        implot.plot_inf_lines("##axes_x", np.array([0.0]), **style(line_color=GREY))
         implot.plot_inf_lines("##axes_y", np.array([0.0]),
-                              implot.Spec(line_color=GREY,
-                                          flags=implot.InfLinesFlags_.horizontal))
+                              **style(line_color=GREY,
+                                      flags=implot.InfLinesFlags_.horizontal))
         if len(symbols):
             implot.plot_scatter("Символы", symbols.real.copy(), symbols.imag.copy(),
-                                implot.Spec(marker=implot.Marker_.circle, marker_size=1.5,
-                                            marker_fill_color=ACCENT, marker_line_color=ACCENT,
-                                            fill_alpha=0.3))
+                                **style(marker=implot.Marker_.circle, marker_size=1.5,
+                                        marker_fill_color=ACCENT, marker_line_color=ACCENT,
+                                        fill_alpha=0.3))
         mod = self.modulation()
         if mod:
             ideal = IDEAL[mod]
             implot.plot_scatter(f"Идеальные точки {mod}", ideal.real.copy(), ideal.imag.copy(),
-                                implot.Spec(marker=implot.Marker_.cross, marker_size=10,
-                                            marker_line_color=IDEAL_COLOR, line_weight=2))
+                                **style(marker=implot.Marker_.cross, marker_size=10,
+                                        marker_line_color=IDEAL_COLOR, line_weight=2))
         implot.end_plot()
 
     def timing_plot(self, height):
@@ -934,7 +968,7 @@ class App:
         if self.result is not None and len(self.result["taus"]):
             values, counts = np.unique(self.result["taus"], return_counts=True)
             implot.plot_bars("Пакетов", values.astype(np.float64), counts.astype(np.float64),
-                             0.6, implot.Spec(fill_color=ACCENT, line_color=ACCENT))
+                             0.6, **style(fill_color=ACCENT, line_color=ACCENT))
         implot.end_plot()
 
     def errors_plot(self):
@@ -952,9 +986,9 @@ class App:
                                      imgui.Cond_.always)
             t = self.result["starts"] * 1e3 / FS
             implot.plot_bars("Ошибок", t, errors.astype(np.float64), BUFFER * 1e3 / FS,
-                             implot.Spec(fill_color=BAD, line_color=BAD))
+                             **style(fill_color=BAD, line_color=BAD))
             # Область, видимая на графике амплитуды
-            implot.plot_inf_lines("Окно", np.array(self.cur), implot.Spec(line_color=GREY))
+            implot.plot_inf_lines("Окно", np.array(self.cur), **style(line_color=GREY))
         implot.end_plot()
 
     def placeholder(self):
