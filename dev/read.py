@@ -964,7 +964,10 @@ class App:
         first = self.sps // 2
         implot.setup_axis_limits(implot.ImAxis_.x1, first - 0.7, first + self.sps - 0.3,
                                  imgui.Cond_.always)
-        implot.setup_axis_ticks(implot.ImAxis_.x1, [float(v) for v in range(first, first + self.sps)])
+        # подписи и keep_default передаем явно: в старых imgui-bundle они обязательны
+        ticks = range(first, first + self.sps)
+        implot.setup_axis_ticks(implot.ImAxis_.x1, [float(v) for v in ticks],
+                                [str(v) for v in ticks], False)
         if self.result is not None and len(self.result["taus"]):
             values, counts = np.unique(self.result["taus"], return_counts=True)
             implot.plot_bars("Пакетов", values.astype(np.float64), counts.astype(np.float64),
